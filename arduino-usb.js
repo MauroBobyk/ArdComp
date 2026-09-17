@@ -211,6 +211,19 @@ class ArduinoUSB extends EventTarget {
       request.acceptAllDevices = true;
     }
 
+    // Blindaje: la regla es XOR estricto, así que dejamos el objeto "request"
+    // normalizado pase lo que pase (nunca 'filters' + 'acceptAllDevices' juntos
+    // y nunca los dos ausentes):
+    //   - si hay filtros → se descarta 'acceptAllDevices'
+    //   - si no hay filtros (o el array quedó vacío) → se descartan y se usa
+    //     'acceptAllDevices: true'
+    if (Array.isArray(request.filters) && request.filters.length) {
+      delete request.acceptAllDevices;
+    } else {
+      delete request.filters;
+      request.acceptAllDevices = true;
+    }
+
     let device;
     try {
       device = await navigator.bluetooth.requestDevice(request);
