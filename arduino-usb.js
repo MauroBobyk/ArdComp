@@ -200,11 +200,15 @@ class ArduinoUSB extends EventTarget {
     if (name) filters.push({ name });
     if (namePrefix) filters.push({ namePrefix });
 
+    // Web Bluetooth exige EXACTAMENTE UNO de los dos:
+    //   - 'filters'          (cuando se pidió un nombre/prefijo)
+    //   - 'acceptAllDevices' (cuando no hay filtros)
+    // Nunca los dos juntos y nunca ninguno de los dos.
+    // 'optionalServices' se puede usar en ambos casos.
     if (filters.length) {
       request.filters = filters;
-      delete request.optionalServices;
-      // Sin servicios opcionales no podríamos acceder al UART: los agregamos igual.
-      request.optionalServices = [service];
+    } else {
+      request.acceptAllDevices = true;
     }
 
     let device;
