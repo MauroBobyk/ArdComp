@@ -100,6 +100,15 @@
       outline: none;
     }
     input:focus { border-color: var(--accent); }
+    select {
+      padding: 0.7rem 0.9rem;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      background: #0b1220;
+      color: var(--text);
+      outline: none;
+    }
+    select:focus { border-color: var(--accent); }
     .log {
       background: #0b1220;
       border: 1px solid #334155;
@@ -118,16 +127,25 @@
     .log .in { color: var(--green); }
     .log .out { color: var(--accent); }
     .log .sys { color: var(--muted); }
+    arduino-usb { display: block; }
+    #camara video { width: 100%; border-radius: 10px; margin-top: 0.75rem; }
+    #foto { display: none; width: 100%; border-radius: 10px; margin-top: 0.75rem; }
   </style>
 </head>
 <body>
   <div class="app">
-    <h1>Arduino USB / Bluetooth</h1>
-    <p class="sub">Demo de la clase ArduinoUSB con Web Serial y Web Bluetooth</p>
-
     <div class="status" id="status">
       <span class="dot"></span>
       <span id="status-text">Desconectado</span>
+    </div>
+
+    <div class="send">
+      <label for="baudios" style="align-self: center; color: var(--muted); font-size: 0.85rem; white-space: nowrap;">Baudios:</label>
+      <select id="baudios">
+        <option value="115200" selected>115200 — ESP32</option>
+        <option value="57600">57600</option>
+        <option value="9600">9600 — UNO</option>
+      </select>
     </div>
 
     <div class="row">
@@ -142,10 +160,33 @@
     </div>
 
     <div class="log" id="log"></div>
+
+    <div class="row">
+      <button id="btn-cam">📷 Cámara</button>
+      <button id="btn-foto" class="secondary">📸 Capturar foto</button>
+      <button id="btn-cam-off" class="secondary">Detener cámara</button>
+    </div>
+
+    <div id="camara" style="display:none;">
+      <arduino-usb id="arduino" eventos="componentes" baudios="9600" prefijo-ble="ESP32"></arduino-usb>
+    </div>
+
+    <img id="foto" alt="Foto capturada" />
   </div>
 
-  <script type="module">
-    import ArduinoUSB from './arduino-usb.js';
+  <script src="./arduino-usb.js"></script>
+  <script>
+    // ---------------------------------------------------------------------
+    // Objeto de handlers que recibe el componente por el atributo "eventos".
+    // Cada función recibe como único argumento el "detail" del evento.
+    // ---------------------------------------------------------------------
+    window.componentes = {
+      onConnect:    (d) => logLine('✔ Conectado por ' + d.transporte, 'sys'),
+      onDisconnect: (d) => logLine('✖ Desconectado' + (d.motivo ? ' (' + d.motivo + ')' : ''), 'sys'),
+      onError:      (e) => logLine('✖ Error: ' + (e.message || e), 'sys'),
+      // onData:    (texto) => logData(texto, 'in'),   // datos crudos tal cual llegan
+      // onLine:    (linea) => logLine(linea, 'in'),   // una línea completa
+    };
 
     const $ = (id) => document.getElementById(id);
     const status = $('status');
@@ -156,8 +197,14 @@
     const btnDisc = $('btn-disc');
     const btnSend = $('btn-send');
     const msg = $('msg');
+    const btnCam = $('btn-cam');
+    const btnFoto = $('btn-foto');
+    const btnCamOff = $('btn-cam-off');
+    const cajaCamara = $('camara');
+    const foto = $('foto');
+    const selBaudios = $('baudios');
 
-    const arduino = new ArduinoUSB({ baudRate: 9600 });
+    const arduino = $('arduino');
 
     let currentLine = null;
 
@@ -184,7 +231,6 @@
         const isLast = i === parts.length - 1;
 
         if (isLast && parts[i] === '') {
-          // Nada pendiente tras el último salto de línea.
           if (i === 0) break; // el trozo era solo '\n'
           currentLine = null;
           break;
@@ -193,7 +239,7 @@
         if (!currentLine) newLine(cls);
         currentLine.textContent += parts[i];
 
-        if (!isLast) currentLine = null; // el siguiente trozo empieza línea nueva
+        if (!isLast) currentLine = null;
       }
 
       log.scrollTop = log.scrollHeight;
@@ -209,35 +255,38 @@
     }
 
     // Soporte del navegador
-    if (!arduino.usbSupported) logLine('⚠ Web Serial no soportado en este navegador.');
-    if (!arduino.bluetoothSupported) logLine('⚠ Web Bluetooth no soportado en este navegador.');
+    if (!arduino.soportaUSB) logLine('⚠ Web Serial no soportado en este navegador.');
+    if (!arduino.soportaBluetooth) logLine('⚠ Web Bluetooth no soportado en este navegador.');
 
-    // Eventos
-    arduino.addEventListener('connect', (e) => {
-      const t = e.detail.transport;
+    // Eventos DOM del componente
+    arduino.addEventListener('arduino:connect', (e) => {
       currentLine = null;
-      logLine(`✔ Conectado por ${t}`, 'sys');
-      setConnected(true, t);
+      const d = e.detail;
+      const etiqueta = d.transporte === 'usb' && d.baudios ? `usb ${d.baudios}` : d.transporte;
+      setConnected(true, etiqueta);
     });
 
-    arduino.addEventListener('data', (e) => {
+    arduino.addEventListener('arduino:data', (e) => {
       logData(e.detail, 'in');
     });
 
-    arduino.addEventListener('disconnect', (e) => {
-      logLine(`✖ Desconectado${e.detail.reason ? ' (' + e.detail.reason + ')' : ''}`, 'sys');
+    arduino.addEventListener('arduino:disconnect', (e) => {
       currentLine = null;
       setConnected(false);
     });
 
-    arduino.addEventListener('error', (e) => {
-      logLine('✖ Error: ' + (e.detail.message || e.detail), 'sys');
+    arduino.addEventListener('arduino:camera', (e) => {
+      logLine(e.detail.activa ? '📷 Cámara encendida' : '📷 Cámara detenida', 'sys');
+    });
+
+    arduino.addEventListener('arduino:photo', () => {
+      logLine('📸 Foto capturada', 'sys');
     });
 
     // Acciones
     btnUsb.addEventListener('click', async () => {
       try {
-        await arduino.connectUSB({ baudRate: 9600 });
+        await arduino.conectarUSB(Number(selBaudios.value));
       } catch (err) {
         logLine('✖ ' + err.message, 'sys');
       }
@@ -245,20 +294,19 @@
 
     btnBt.addEventListener('click', async () => {
       try {
-        // Ajusta el prefijo/nombre a tu módulo (HM-10, HC-08, etc.)
-        await arduino.connectBluetooth({ namePrefix: 'HM' });
+        await arduino.conectarBluetooth(); // usa el atributo prefijo-ble="ESP32"
       } catch (err) {
         logLine('✖ ' + err.message, 'sys');
       }
     });
 
-    btnDisc.addEventListener('click', () => arduino.disconnect());
+    btnDisc.addEventListener('click', () => arduino.desconectar());
 
     btnSend.addEventListener('click', async () => {
       const text = msg.value;
       if (!text) return;
       try {
-        await arduino.sendLine(text);
+        await arduino.enviarLinea(text);
         logLine(text, 'out');
       } catch (err) {
         logLine('✖ ' + err.message, 'sys');
@@ -267,6 +315,32 @@
 
     msg.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') btnSend.click();
+    });
+
+    // Cámara
+    btnCam.addEventListener('click', async () => {
+      try {
+        await arduino.camara();
+        cajaCamara.style.display = 'block';
+      } catch (err) {
+        logLine('✖ ' + err.message, 'sys');
+      }
+    });
+
+    btnFoto.addEventListener('click', async () => {
+      try {
+        const url = await arduino.capturarFoto();
+        foto.src = url;
+        foto.style.display = 'block';
+      } catch (err) {
+        logLine('✖ ' + err.message, 'sys');
+      }
+    });
+
+    btnCamOff.addEventListener('click', () => {
+      arduino.detenerCamara();
+      cajaCamara.style.display = 'none';
+      foto.style.display = 'none';
     });
   </script>
 </body>

@@ -1,13 +1,26 @@
 /**
  * arduino-usb.js
  * -----------------------------------------------------------------------------
- * Clase para conectar un Arduino a una aplicación web desde el navegador.
+ * Conecta un Arduino (UNO/Nano/Mega o ESP32) a una página web desde el navegador.
+ *
+ * Dos formas de uso:
+ *
+ *   A) Web Component <arduino-usb> (RECOMENDADO para alumnos):
+ *        <script src="./arduino-usb.js"></script>
+ *        <arduino-usb id="arduino" eventos="componentes"></arduino-usb>
+ *
+ *      Métodos: conectarUSB(), conectarBluetooth(), enviar(), enviarLinea(),
+ *               desconectar(), camara(), capturarFoto(), detenerCamara().
+ *      La documentación completa está en README.md.
+ *
+ *   B) Clase ArduinoUSB (uso avanzado):
+ *        import ArduinoUSB from './arduino-usb.js';
  *
  * Soporta dos transportes:
  *   1. USB / puerto serie  ->  Web Serial API  (navigator.serial)
  *   2. Bluetooth (BLE)     ->  Web Bluetooth API (navigator.bluetooth)
  *
- * Uso:
+ * Uso (clase):
  *   import ArduinoUSB from './arduino-usb.js';
  *
  *   const arduino = new ArduinoUSB();
@@ -252,7 +265,16 @@ class ArduinoUSB extends EventTarget {
       }
       await this._writer.write(bytes);
     } else if (this._transport === 'bluetooth') {
-      await this._btWriteChar.writeValue(bytes);
+      // Web Bluetooth no expone el MTU negociado: partimos en trozos seguros
+      // (20 bytes con MTU 23). El ESP32 suele aceptar más, pero así no se
+      // pierden paquetes con cualquier dispositivo.
+      const chunk = this._options.bleChunkSize || BLE_SAFE_CHUNK;
+      for (let i = 0; i < bytes.length; i += chunk) {
+        await this._btWriteChar.writeValue(bytes.subarray(i, i + chunk));
+        if (this._options.bleWriteDelay) {
+          await new Promise((resolve) => setTimeout(resolve, this._options.bleWriteDelay));
+        }
+      }
     }
   }
 
@@ -404,10 +426,305 @@ class ArduinoUSB extends EventTarget {
   }
 }
 
-export { ArduinoUSB };
-export default ArduinoUSB;
-
-// Acceso global (útil si se incluye con <script type="module">).
+// Acceso global de la clase (útil tanto con <script> clásico como con módulos).
 if (typeof window !== 'undefined' && !window.ArduinoUSB) {
   window.ArduinoUSB = ArduinoUSB;
+}
+
+/* ============================================================================
+ * Web Component <arduino-usb>
+ * ============================================================================
+ * Envoltorio pensado para alumnos: no hace falta escribir una clase ni manejar
+ * promesas complejas. Se usa con una etiqueta HTML y métodos simples.
+ *
+ *   <script src="./arduino-usb.js"></script>
+ *   <arduino-usb id="arduino" eventos="componentes"></arduino-usb>
+ *
+ *   <script>
+ *     const arduino = document.getElementById('arduino');
+ *     arduino.conectarUSB();          // abre el selector de puertos
+ *     arduino.enviarLinea('LED:ON');  // envía "LED:ON\n"
+ *   </script>
+ *
+ * Cámara:
+ *   arduino.camara();               // webcam de la PC o cámara del celular
+ *   arduino.capturarFoto();         // devuelve dataURL de la imagen
+ *   arduino.video                   // <video> actual (para librerías de reconocimiento)
+ *
+ * Atributos opcionales:
+ *   eventos="nombreGlobal"  -> objeto con handlers onConnect/onData/onLine/
+ *                              onDisconnect/onError (ver README).
+ *   baudios="9600"          -> velocidad por defecto del puerto USB.
+ *   prefijo-ble="ESP32"     -> prefijo del nombre BLE a buscar.
+ *   fin-linea="\n"          -> carácter(es) de fin de línea para enviarLinea().
+ *   servicio/rx/tx          -> UUIDs del servicio UART (avanzado).
+ *
+ * Eventos DOM que emite (CustomEvent en el elemento):
+ *   arduino:connect, arduino:data, arduino:line, arduino:disconnect,
+ *   arduino:error, arduino:camera, arduino:photo
+ * ============================================================================ */
+
+const EV_CONNECT    = 'arduino:connect';
+const EV_DATA       = 'arduino:data';
+const EV_LINE       = 'arduino:line';
+const EV_DISCONNECT = 'arduino:disconnect';
+const EV_ERROR      = 'arduino:error';
+const EV_CAMERA     = 'arduino:camera';
+const EV_PHOTO      = 'arduino:photo';
+
+// Mapeo entre eventos del componente y funciones del objeto "eventos".
+const EVENTO_A_HANDLER = {
+  [EV_CONNECT]:    'onConnect',
+  [EV_DATA]:       'onData',
+  [EV_LINE]:       'onLine',
+  [EV_DISCONNECT]: 'onDisconnect',
+  [EV_ERROR]:      'onError',
+};
+
+class ArduinoUSBElement extends HTMLElement {
+  constructor() {
+    super();
+    this.__arduino = null;
+    this.__eventos = null;
+    this._camaraStream = null;
+    this._fuente = null; // 'local' (webcam) | null
+    this._video = null;
+    this._canvas = null;
+  }
+
+  /* ------------------------------- atributos ------------------------------ */
+
+  /** Velocidad en baudios por defecto (atributo `baudios`, por defecto 9600). */
+  get baudios() {
+    const v = this.getAttribute('baudios');
+    const n = Number(v);
+    return v !== null && Number.isFinite(n) && n > 0 ? n : 9600;
+  }
+
+  /** Prefijo del nombre BLE (atributo `prefijo-ble`). */
+  get prefijoBle() {
+    return this.getAttribute('prefijo-ble') || '';
+  }
+
+  /** Fin de línea usado por enviarLinea() (atributo `fin-linea`). */
+  get finLinea() {
+    return this.getAttribute('fin-linea') || '\n';
+  }
+
+  get servicio() { return this.getAttribute('servicio') || null; }
+  get rx()       { return this.getAttribute('rx') || null; }
+  get tx()       { return this.getAttribute('tx') || null; }
+
+  /** Objeto de handlers (resuelto desde el atributo `eventos`). */
+  get eventos() {
+    if (this.__eventos) return this.__eventos;
+    const nombre = this.getAttribute('eventos');
+    if (!nombre) return null;
+    const obj = window[nombre];
+    return obj && typeof obj === 'object' ? obj : null;
+  }
+
+  set eventos(objONombre) {
+    if (typeof objONombre === 'string') {
+      this.setAttribute('eventos', objONombre);
+      this.__eventos = null;
+    } else if (objONombre && typeof objONombre === 'object') {
+      this.__eventos = objONombre;
+      this.setAttribute('eventos', '');
+    }
+  }
+
+  /* -------------------------------- estado -------------------------------- */
+
+  get conectado()         { return this._arduino.connected; }
+  get transporte()        { return this._arduino.transport; }
+  get soportaUSB()        { return this._arduino.usbSupported; }
+  get soportaBluetooth()  { return this._arduino.bluetoothSupported; }
+  get camaraActiva()      { return this._fuente !== null; }
+
+  /**
+   * Elemento <video> de la cámara (local o remota). Útil para pasárselo a
+   * librerías de reconocimiento como Teachable Machine, o null si no hay cámara.
+   */
+  get video()             { return this._video; }
+
+  /** Instancia interna de ArduinoUSB (se crea la primera vez que se usa). */
+  get _arduino() {
+    if (!this.__arduino) {
+      const opciones = { baudRate: this.baudios, lineEnding: this.finLinea };
+      if (this.servicio) opciones.bluetoothService = this.servicio;
+      if (this.rx) opciones.bluetoothRxCharacteristic = this.rx;
+      if (this.tx) opciones.bluetoothTxCharacteristic = this.tx;
+
+      this.__arduino = new ArduinoUSB(opciones);
+
+      this.__arduino.addEventListener('connect', (e) => {
+        const d = e.detail;
+        this._emit(EV_CONNECT, {
+          transporte: d.transport,
+          baudios: d.baudRate,
+          puerto: d.port,
+          dispositivo: d.device,
+        });
+      });
+      this.__arduino.addEventListener('data',       (e) => this._emit(EV_DATA, e.detail));
+      this.__arduino.addEventListener('line',       (e) => this._emit(EV_LINE, e.detail));
+      this.__arduino.addEventListener('disconnect', (e) => this._emit(EV_DISCONNECT, {
+        transporte: e.detail.transport,
+        motivo: e.detail.reason,
+      }));
+      this.__arduino.addEventListener('error',      (e) => this._emit(EV_ERROR, e.detail));
+    }
+    return this.__arduino;
+  }
+
+  /** Emite el evento DOM y, si hay handler en "eventos", lo llama. */
+  _emit(tipo, detalle) {
+    this.dispatchEvent(new CustomEvent(tipo, { detail: detalle }));
+
+    const handler = EVENTO_A_HANDLER[tipo];
+    if (!handler) return;
+
+    const eventos = this.eventos;
+    if (eventos && typeof eventos[handler] === 'function') {
+      try {
+        eventos[handler](detalle);
+      } catch (err) {
+        console.error(`[arduino-usb] Error en el handler "${handler}":`, err);
+      }
+    }
+  }
+
+  /* ------------------------------- conexión ------------------------------- */
+
+  /**
+   * Conecta por cable USB (Web Serial). Abre el selector de puertos.
+   * @param {number} [baudios] Velocidad (si no se indica, usa el atributo `baudios`).
+   * @returns {Promise<Object>} Información del puerto.
+   */
+  conectarUSB(baudios) {
+    const rate = Number(baudios);
+    return this._arduino.connectUSB({
+      baudRate: Number.isFinite(rate) && rate > 0 ? rate : this.baudios,
+    });
+  }
+
+  /**
+   * Conecta por Bluetooth (BLE). Abre el selector de dispositivos.
+   * @param {string} [prefijo] Prefijo del nombre BLE (si no, usa `prefijo-ble`).
+   * @returns {Promise<Object>} { nombre, id } del dispositivo.
+   */
+  conectarBluetooth(prefijo) {
+    const opts = {};
+    const p = prefijo || this.prefijoBle;
+    if (p) opts.namePrefix = p;
+    return this._arduino.connectBluetooth(opts);
+  }
+
+  /** Envía datos al dispositivo conectado. */
+  enviar(datos) {
+    return this._arduino.send(datos);
+  }
+
+  /** Envía texto y agrega el fin de línea configurado (por defecto '\n'). */
+  enviarLinea(texto) {
+    return this._arduino.sendLine(texto);
+  }
+
+  /** Cierra la conexión activa (USB o Bluetooth). */
+  desconectar() {
+    return this._arduino.disconnect();
+  }
+
+  /* -------------------------------- cámara -------------------------------- */
+
+  /** Crea (si hace falta) el <video> interno donde se muestra la cámara. */
+  _asegurarVideo() {
+    if (this._video) return this._video;
+
+    this._video = document.createElement('video');
+    this._video.setAttribute('autoplay', '');
+    this._video.setAttribute('playsinline', '');
+    this._video.setAttribute('muted', '');
+    this._video.style.width = '100%';
+    this._video.style.maxWidth = '640px';
+    this.appendChild(this._video);
+    return this._video;
+  }
+
+  /**
+   * Enciende la cámara del dispositivo (webcam de la PC o cámara del celular,
+   * según dónde se abra la página) y muestra la vista previa dentro del
+   * componente.
+   * @returns {Promise<MediaStream>} El stream de la cámara local.
+   */
+  async camara() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('La cámara no está disponible en este navegador. Sirve la página por HTTPS o localhost.');
+    }
+    if (this._fuente === 'local' && this._camaraStream) return this._camaraStream;
+
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    this._camaraStream = stream;
+    this._fuente = 'local';
+
+    const video = this._asegurarVideo();
+    video.srcObject = stream;
+    try { await video.play(); } catch (err) { /* el autoplay puede requerir interacción */ }
+
+    this._emit(EV_CAMERA, { activa: true, fuente: 'local', stream });
+    return stream;
+  }
+
+  /**
+   * Captura una foto de la cámara y devuelve su URL
+   * (dataURL PNG). Si la cámara no está encendida, la enciende primero.
+   * @returns {Promise<string>} Imagen en formato data:image/png;base64,...
+   */
+  async capturarFoto() {
+    if (this._fuente === null) await this.camara();
+
+    // Damos un instante a que el <video> tenga dimensiones reales.
+    if (!this._video || !this._video.videoWidth) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+
+    const video = this._video;
+    if (!this._canvas) this._canvas = document.createElement('canvas');
+
+    this._canvas.width  = video.videoWidth  || 1280;
+    this._canvas.height = video.videoHeight || 720;
+    const ctx = this._canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, this._canvas.width, this._canvas.height);
+
+    const foto = this._canvas.toDataURL('image/png');
+    this._emit(EV_PHOTO, { foto });
+    return foto;
+  }
+
+  /** Apaga la cámara (local o remota) y quita la vista previa. */
+  detenerCamara() {
+    if (this._camaraStream) {
+      this._camaraStream.getTracks().forEach((track) => track.stop());
+      this._camaraStream = null;
+    }
+    if (this._video) {
+      this._video.pause();
+      this._video.srcObject = null;
+      this._video.src = '';
+      if (this._video.parentNode === this) this.removeChild(this._video);
+      this._video = null;
+    }
+    this._fuente = null;
+    this._emit(EV_CAMERA, { activa: false });
+  }
+}
+
+// Registrar el componente solo si no existe ya.
+if (typeof customElements !== 'undefined' && !customElements.get('arduino-usb')) {
+  customElements.define('arduino-usb', ArduinoUSBElement);
+}
+
+if (typeof window !== 'undefined' && !window.ArduinoUSBElement) {
+  window.ArduinoUSBElement = ArduinoUSBElement;
 }
