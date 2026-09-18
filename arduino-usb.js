@@ -43,6 +43,14 @@ const NORDIC_UART_SERVICE   = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const NORDIC_UART_RX_CHAR  = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // Escribimos aquí (RX del módulo)
 const NORDIC_UART_TX_CHAR  = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // Leemos aquí (TX del módulo, notifica)
 
+/**
+ * Bytes por paquete al escribir por BLE. Web Bluetooth no expone el MTU
+ * negociado, así que usamos el tamaño seguro garantizado por la especificación:
+ * MTU mínimo 23 → 20 bytes de datos útiles (23 - 3 de cabecera ATT).
+ * Si subís este valor, subilo también del lado del dispositivo (NOTIFY_CHUNK).
+ */
+const BLE_SAFE_CHUNK = 20;
+
 class ArduinoUSB extends EventTarget {
   /**
    * @param {Object} [options] Configuración por defecto.
